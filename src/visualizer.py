@@ -54,25 +54,50 @@ class InteractiveVisualizer:
     def initialize(self, window_name: str = "LIDAR Editor", width: int = 1200, height: int = 800):
         """Initialize the visualizer window"""
         try:
-            self.vis = o3d.visualization.VisualizerWithEditing()
-            self.vis.create_window(window_name, width, height)
+            logger.info("Initializing Open3D visualizer...")
+            
+            # Try to create visualizer with fallback options
+            try:
+                self.vis = o3d.visualization.VisualizerWithEditing()
+                self.vis.create_window(window_name, width, height, visible=True)
+            except Exception as e:
+                logger.warning(f"Failed to create VisualizerWithEditing: {e}")
+                # Fallback to basic visualizer
+                self.vis = o3d.visualization.Visualizer()
+                self.vis.create_window(window_name, width, height, visible=True)
             
             # Set up rendering options
             render_option = self.vis.get_render_option()
             render_option.background_color = np.array([0.1, 0.1, 0.1])
             render_option.point_size = 2.0
             render_option.show_coordinate_frame = True
+            render_option.light_on = True
+            
+            # Add coordinate frame for reference
+            coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0)
+            self.vis.add_geometry(coordinate_frame)
             
             logger.info("Visualizer initialized successfully")
             return True
             
         except Exception as e:
             logger.error(f"Failed to initialize visualizer: {e}")
+            logger.error("This might be due to missing OpenGL support or X11 forwarding issues")
             return False
     
     def set_point_cloud(self, point_cloud: o3d.geometry.PointCloud):
         """Set the point cloud to visualize"""
-        self.point_cloud = point_cloud.copy()
+        if len(point_cloud.points) == 0:
+            logger.warning("Empty point cloud provided")
+            return
+        
+        # Create a copy of the point cloud
+        self.point_cloud = o3d.geometry.PointCloud()
+        self.point_cloud.points = point_cloud.points
+        if hasattr(point_cloud, 'colors') and len(point_cloud.colors) > 0:
+            self.point_cloud.colors = point_cloud.colors
+        if hasattr(point_cloud, 'normals') and len(point_cloud.normals) > 0:
+            self.point_cloud.normals = point_cloud.normals
         
         # Store original colors or create default ones
         if len(point_cloud.colors) > 0:
@@ -86,9 +111,31 @@ class InteractiveVisualizer:
         self.selection_regions.clear()
         
         if self.vis is not None:
+            # Clear geometries but keep coordinate frame
             self.vis.clear_geometries()
+            
+            # Re-add coordinate frame
+            coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0)
+            self.vis.add_geometry(coordinate_frame)
+            
+            # Add point cloud
             self.vis.add_geometry(self.point_cloud)
+            
+            # Calculate proper viewing bounds
+            bbox = self.point_cloud.get_axis_aligned_bounding_box()
+            center = bbox.get_center()
+            extent = bbox.get_extent()
+            max_extent = np.max(extent)
+            
+            # Set camera to show entire point cloud
             self.vis.reset_view_point(True)
+            
+            # Update the view
+            self.vis.poll_events()
+            self.vis.update_renderer()
+            
+            logger.info(f"Point cloud loaded: {len(self.point_cloud.points)} points")
+            logger.info(f"Bounds: center={center}, extent={extent}")
     
     def color_points_by_classification(self, dynamic_indices: np.ndarray, static_indices: np.ndarray, 
                                      ground_indices: Optional[np.ndarray] = None):

@@ -6,6 +6,7 @@ Handles loading and saving of PCD files using Open3D
 import open3d as o3d
 import numpy as np
 import logging
+import time
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
 
@@ -18,52 +19,94 @@ class PointCloudLoader:
     
     def __init__(self):
         self.point_cloud = None
-        self.original_points = None
+        # self.original_points = None
         self.metadata = {}
     
-    def load_pcd(self, file_path: str) -> bool:
+    def load_pcd(self, file_path: str, downsample_for_preview: bool = True, max_points_preview: int = 1000000) -> bool:
         """
-        Load PCD file using Open3D
+        Load PCD file with optional downsampling for large files
         
         Args:
             file_path: Path to PCD file
-            
-        Returns:
-            bool: True if successful, False otherwise
+            downsample_for_preview: Whether to downsample large files for faster loading
+            max_points_preview: Maximum points to keep for preview (if downsampling)
         """
         try:
             file_path = Path(file_path)
             if not file_path.exists():
                 logger.error(f"File not found: {file_path}")
                 return False
-            
+
             logger.info(f"Loading PCD file: {file_path}")
-            self.point_cloud = o3d.io.read_point_cloud(str(file_path))
+            t0 = time.perf_counter()
             
-            if len(self.point_cloud.points) == 0:
+            # Load the point cloud
+            pc = o3d.io.read_point_cloud(str(file_path))
+            t1 = time.perf_counter()
+            logger.info(f"Initial load: {t1-t0:.3f}s")
+
+            if len(pc.points) == 0:
                 logger.error("No points found in the file")
                 return False
+
+            original_count = len(pc.points)
+            logger.info(f"Original point count: {original_count:,}")
             
-            # Store original points for reference
-            self.original_points = np.asarray(self.point_cloud.points).copy()
-            
-            # Extract metadata
-            self.metadata = {
-                'num_points': len(self.point_cloud.points),
-                'has_colors': len(self.point_cloud.colors) > 0,
-                'has_normals': len(self.point_cloud.normals) > 0,
-                'file_path': str(file_path),
-                'bounds': self.get_bounds()
-            }
-            
-            logger.info(f"Successfully loaded {self.metadata['num_points']} points")
-            logger.info(f"Bounds: {self.metadata['bounds']}")
-            
+            # Downsample if file is too large
+            if downsample_for_preview and original_count > max_points_preview:
+                logger.info(f"Downsampling from {original_count:,} to ~{max_points_preview:,} points for faster visualization")
+                
+                # Calculate voxel size for downsampling
+                # Use approximate voxel size to get desired number of points
+                points = np.asarray(pc.points)
+                bbox_size = points.max(axis=0) - points.min(axis=0)
+                total_volume = np.prod(bbox_size)
+                target_density = max_points_preview / total_volume
+                voxel_size = (1.0 / target_density) ** (1/3)
+                
+                # Apply voxel downsampling
+                t2 = time.perf_counter()
+                pc_downsampled = pc.voxel_down_sample(voxel_size)
+                t3 = time.perf_counter()
+                
+                logger.info(f"Downsampling: {t3-t2:.3f}s, reduced to {len(pc_downsampled.points):,} points")
+                self.point_cloud = pc_downsampled
+                self.original_points = pc  # Store original for later use
+                
+                # Mark as downsampled in metadata
+                self.metadata = {
+                    'num_points': len(self.point_cloud.points),
+                    'original_num_points': original_count,
+                    'is_downsampled': True,
+                    'downsample_ratio': len(self.point_cloud.points) / original_count,
+                    'has_colors': len(self.point_cloud.colors) > 0,
+                    'has_normals': len(self.point_cloud.normals) > 0,
+                    'file_path': str(file_path),
+                    'bounds': None  # compute on demand
+                }
+            else:
+                self.point_cloud = pc
+                self.original_points = None
+                
+                self.metadata = {
+                    'num_points': len(self.point_cloud.points),
+                    'original_num_points': original_count,
+                    'is_downsampled': False,
+                    'downsample_ratio': 1.0,
+                    'has_colors': len(self.point_cloud.colors) > 0,
+                    'has_normals': len(self.point_cloud.normals) > 0,
+                    'file_path': str(file_path),
+                    'bounds': None  # compute on demand
+                }
+
+            total_time = time.perf_counter() - t0
+            logger.info(f"Successfully loaded in {total_time:.3f}s - showing {self.metadata['num_points']:,} points")
             return True
-            
+
         except Exception as e:
             logger.error(f"Error loading PCD file: {e}")
             return False
+
     
     def save_pcd(self, file_path: str, point_cloud: Optional[o3d.geometry.PointCloud] = None) -> bool:
         """
@@ -190,6 +233,27 @@ class PointCloudLoader:
     def get_info(self) -> Dict[str, Any]:
         """Get information about the loaded point cloud"""
         return self.metadata.copy()
+    
+    def get_original_point_cloud(self) -> Optional[o3d.geometry.PointCloud]:
+        """Get the original (non-downsampled) point cloud if available"""
+        return self.original_points
+    
+    def is_downsampled(self) -> bool:
+        """Check if current point cloud is downsampled"""
+        return self.metadata.get('is_downsampled', False)
+    
+    def get_downsample_info(self) -> Dict[str, Any]:
+        """Get downsampling information"""
+        if not self.is_downsampled():
+            return {}
+        
+        return {
+            'is_downsampled': True,
+            'original_count': self.metadata.get('original_num_points', 0),
+            'current_count': self.metadata.get('num_points', 0),
+            'ratio': self.metadata.get('downsample_ratio', 1.0),
+            'reduction_percent': (1 - self.metadata.get('downsample_ratio', 1.0)) * 100
+        }
 
 
 def test_loader():

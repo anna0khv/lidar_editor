@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QSlider, QSpinBox, QDoubleSpinBox,
     QCheckBox, QComboBox, QTextEdit, QProgressBar, QFileDialog,
     QMessageBox, QTabWidget, QTableWidget, QTableWidgetItem,
-    QHeaderView, QFrame
+    QHeaderView, QFrame, QScrollArea
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
 from PyQt6.QtGui import QAction, QIcon, QFont, QPixmap
@@ -34,10 +34,34 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+class LoaderWorker(QThread):
+    """Worker thread for loading PCD files"""
+    
+    progress_updated = pyqtSignal(int)
+    loading_completed = pyqtSignal(bool)  # success
+    error_occurred = pyqtSignal(str)
+    
+    def __init__(self, loader: PointCloudLoader, file_path: str, downsample: bool = True):
+        super().__init__()
+        self.loader = loader
+        self.file_path = file_path
+        self.downsample = downsample
+    
+    def run(self):
+        try:
+            self.progress_updated.emit(20)
+            success = self.loader.load_pcd(self.file_path, downsample_for_preview=self.downsample)
+            self.progress_updated.emit(100)
+            self.loading_completed.emit(success)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+
 class DetectionWorker(QThread):
     """Worker thread for running detection algorithms"""
     
     progress_updated = pyqtSignal(int)
+    status_updated = pyqtSignal(str)
     detection_completed = pyqtSignal(object)  # DetectionResult
     error_occurred = pyqtSignal(str)
     
@@ -48,10 +72,34 @@ class DetectionWorker(QThread):
     
     def run(self):
         try:
+            self.progress_updated.emit(5)
+            self.status_updated.emit("Инициализация...")
+            
+            # Check if we have too many points
+            points = np.asarray(self.detector.point_cloud.points)
+            self.status_updated.emit(f"Обработка {len(points):,} точек...")
+            
             self.progress_updated.emit(10)
+            self.status_updated.emit("Обнаружение плоскости земли...")
+            
+            self.progress_updated.emit(25)
+            self.status_updated.emit("Фильтрация по высоте...")
+            
+            self.progress_updated.emit(40)
+            self.status_updated.emit("Кластеризация точек...")
+            
+            self.progress_updated.emit(60)
+            self.status_updated.emit("Классификация объектов...")
+            
             result = self.detector.detect_dynamic_objects(self.method)
+            
+            self.progress_updated.emit(90)
+            self.status_updated.emit("Завершение обработки...")
+            
             self.progress_updated.emit(100)
+            self.status_updated.emit("Готово!")
             self.detection_completed.emit(result)
+            
         except Exception as e:
             self.error_occurred.emit(str(e))
 
@@ -214,7 +262,18 @@ class StatisticsPanel(QWidget):
     def update_file_info(self, info: Dict):
         """Update file information display"""
         self.file_path_label.setText(f"Файл: {info.get('file_path', 'Неизвестно')}")
-        self.total_points_label.setText(f"Всего точек: {info.get('num_points', 0):,}")
+        
+        # Show downsampling info if applicable
+        if info.get('is_downsampled', False):
+            original_count = info.get('original_num_points', 0)
+            current_count = info.get('num_points', 0)
+            reduction = (1 - info.get('downsample_ratio', 1.0)) * 100
+            self.total_points_label.setText(
+                f"Точек: {current_count:,} из {original_count:,}\n"
+                f"(сжато на {reduction:.1f}% для быстрой загрузки)"
+            )
+        else:
+            self.total_points_label.setText(f"Всего точек: {info.get('num_points', 0):,}")
         
         bounds = info.get('bounds', {})
         if bounds:
@@ -251,6 +310,8 @@ class MainWindow(QMainWindow):
         self.visualizer = None
         self.detection_result = None
         self.detection_worker = None
+        self.loader_worker = None
+        self.current_file_path = None
         
         # UI components
         self.parameter_panel = None
@@ -281,8 +342,12 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(splitter)
         
         # Left panel (controls)
-        left_panel = self.create_left_panel()
-        splitter.addWidget(left_panel)
+        left_widget = self.create_left_panel()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(left_widget)
+        scroll.setMinimumWidth(300)   # или другое значение по вкусу
+        splitter.addWidget(scroll)
         
         # Right panel (visualization placeholder)
         right_panel = self.create_right_panel()
@@ -299,6 +364,8 @@ class MainWindow(QMainWindow):
         
         # Create status bar
         self.create_status_bar()
+        self.showMaximized()
+
     
     def create_left_panel(self) -> QWidget:
         """Create the left control panel"""
@@ -309,9 +376,13 @@ class MainWindow(QMainWindow):
         file_group = QGroupBox("Файл")
         file_layout = QVBoxLayout()
         
-        load_btn = QPushButton("Загрузить PCD")
+        load_btn = QPushButton("Загрузить PCD (быстро)")
         load_btn.clicked.connect(self.load_file)
         file_layout.addWidget(load_btn)
+        
+        load_full_btn = QPushButton("Загрузить полный файл")
+        load_full_btn.clicked.connect(self.load_full_file)
+        file_layout.addWidget(load_full_btn)
         
         save_btn = QPushButton("Сохранить PCD")
         save_btn.clicked.connect(self.save_file)
@@ -374,16 +445,24 @@ class MainWindow(QMainWindow):
         # Info text
         info_label = QLabel(
             "Добро пожаловать в Редактор лидарных карт!\n\n"
-            "1. Загрузите PCD файл\n"
-            "2. Настройте параметры обнаружения\n"
-            "3. Запустите автоматическое обнаружение\n"
-            "4. Откройте 3D вид для ручного редактирования\n"
-            "5. Сохраните результат\n\n"
-            "Горячие клавиши в 3D виде:\n"
+            "🚀 НОВЫЕ ВОЗМОЖНОСТИ:\n"
+            "• Быстрая загрузка больших файлов с автосжатием\n"
+            "• Прогресс-бар загрузки\n"
+            "• Возможность загрузки полного файла\n\n"
+            "📋 ИНСТРУКЦИЯ:\n"
+            "1. Нажмите 'Загрузить PCD (быстро)' для сжатого файла\n"
+            "2. Или 'Загрузить полный файл' для полного качества\n"
+            "3. Настройте параметры обнаружения\n"
+            "4. Запустите автоматическое обнаружение\n"
+            "5. Откройте 3D вид для ручного редактирования\n"
+            "6. Сохраните результат\n\n"
+            "⌨️ Горячие клавиши в 3D виде:\n"
             "D - удалить выделенные точки\n"
             "C - копировать выделенные точки\n"
             "V - вставить точки\n"
-            "S - сохранить"
+            "S - сохранить\n\n"
+            "💡 Большие файлы (>1M точек) автоматически сжимаются\n"
+            "для быстрой визуализации и обработки."
         )
         info_label.setAlignment(Qt.AlignmentFlag.AlignTop)
         info_label.setStyleSheet("""
@@ -486,25 +565,54 @@ class MainWindow(QMainWindow):
         if self.parameter_panel:
             self.parameter_panel.parameters_changed.connect(self.update_detection_parameters)
     
-    def load_file(self):
-        """Load a PCD file"""
+    def load_file(self, downsample=True):
+        """Load a PCD file with optional downsampling"""
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Загрузить PCD файл", "", "PCD files (*.pcd);;All files (*)"
         )
         
         if file_path:
-            self.statusBar().showMessage("Загрузка файла...")
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setRange(0, 0)  # Indeterminate progress
-            
-            # Load in separate thread to avoid blocking UI
-            def load_worker():
-                success = self.loader.load_pcd(file_path)
-                
-                # Update UI in main thread
-                QTimer.singleShot(0, lambda: self.on_file_loaded(success))
-            
-            threading.Thread(target=load_worker, daemon=True).start()
+            self._start_loading(file_path, downsample)
+    
+    def load_full_file(self):
+        """Load full PCD file without downsampling"""
+        if self.current_file_path:
+            # Reload current file without downsampling
+            result = QMessageBox.question(
+                self, "Загрузить полный файл",
+                "Загрузить полный файл без сжатия? Это может занять больше времени.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if result == QMessageBox.StandardButton.Yes:
+                self._start_loading(self.current_file_path, downsample=False)
+        else:
+            # Load new file without downsampling
+            file_path, _ = QFileDialog.getOpenFileName(
+                self, "Загрузить PCD файл (полный)", "", "PCD files (*.pcd);;All files (*)"
+            )
+            if file_path:
+                self._start_loading(file_path, downsample=False)
+    
+    def _start_loading(self, file_path: str, downsample: bool):
+        """Start loading with worker thread"""
+        if self.loader_worker and self.loader_worker.isRunning():
+            QMessageBox.information(self, "Информация", "Загрузка уже выполняется")
+            return
+        
+        load_type = "сжатие" if downsample else "полную загрузку"
+        self.statusBar().showMessage(f"Загрузка файла ({load_type})...")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 100)
+        
+        # Store file path
+        self.current_file_path = file_path
+        
+        # Start loader worker
+        self.loader_worker = LoaderWorker(self.loader, file_path, downsample)
+        self.loader_worker.progress_updated.connect(self.progress_bar.setValue)
+        self.loader_worker.loading_completed.connect(self.on_file_loaded)
+        self.loader_worker.error_occurred.connect(self.on_loading_error)
+        self.loader_worker.start()
     
     def on_file_loaded(self, success: bool):
         """Handle file loading completion"""
@@ -514,13 +622,24 @@ class MainWindow(QMainWindow):
             info = self.loader.get_info()
             self.statistics_panel.update_file_info(info)
             self.detector.set_point_cloud(self.loader.get_point_cloud())
-            self.statusBar().showMessage(f"Загружено {info['num_points']:,} точек")
             
-            # Store file path for saving
-            self.current_file_path = info['file_path']
+            # Show loading info
+            if info.get('is_downsampled', False):
+                self.statusBar().showMessage(
+                    f"Загружено {info['num_points']:,} точек "
+                    f"(сжато из {info['original_num_points']:,})"
+                )
+            else:
+                self.statusBar().showMessage(f"Загружено {info['num_points']:,} точек")
         else:
             QMessageBox.critical(self, "Ошибка", "Не удалось загрузить файл")
             self.statusBar().showMessage("Ошибка загрузки")
+    
+    def on_loading_error(self, error_msg: str):
+        """Handle loading error"""
+        self.progress_bar.setVisible(False)
+        QMessageBox.critical(self, "Ошибка загрузки", error_msg)
+        self.statusBar().showMessage("Ошибка загрузки")
     
     def save_file(self):
         """Save the current point cloud"""
@@ -563,12 +682,13 @@ class MainWindow(QMainWindow):
         # Start detection in worker thread
         self.detection_worker = DetectionWorker(self.detector, "geometric")
         self.detection_worker.progress_updated.connect(self.progress_bar.setValue)
+        self.detection_worker.status_updated.connect(self.statusBar().showMessage)
         self.detection_worker.detection_completed.connect(self.on_detection_completed)
         self.detection_worker.error_occurred.connect(self.on_detection_error)
         
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 100)
-        self.statusBar().showMessage("Выполняется обнаружение объектов...")
+        self.statusBar().showMessage("Подготовка обнаружения объектов...")
         
         self.detection_worker.start()
     
@@ -684,6 +804,10 @@ class MainWindow(QMainWindow):
         if self.detection_worker and self.detection_worker.isRunning():
             self.detection_worker.terminate()
             self.detection_worker.wait()
+        
+        if self.loader_worker and self.loader_worker.isRunning():
+            self.loader_worker.terminate()
+            self.loader_worker.wait()
         
         event.accept()
 

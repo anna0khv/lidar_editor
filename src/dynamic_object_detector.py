@@ -106,7 +106,7 @@ class DynamicObjectDetector:
     
     def cluster_points(self, points: np.ndarray, indices: np.ndarray) -> List[np.ndarray]:
         """
-        Cluster points using DBSCAN
+        Cluster points using optimized DBSCAN for large datasets
         
         Args:
             points: Point array
@@ -120,22 +120,65 @@ class DynamicObjectDetector:
         
         cluster_points = points[indices]
         
-        # Apply DBSCAN clustering
-        clustering = DBSCAN(
-            eps=self.detection_params['cluster_eps'],
-            min_samples=self.detection_params['cluster_min_samples']
-        ).fit(cluster_points)
+        logger.info(f"Clustering {len(cluster_points)} points...")
         
-        clusters = []
-        unique_labels = np.unique(clustering.labels_)
-        
-        for label in unique_labels:
-            if label == -1:  # Noise points
-                continue
+        # For large datasets, use optimized approach
+        if len(cluster_points) > 30000:
+            logger.info("Large dataset detected, using optimized clustering...")
             
-            cluster_mask = clustering.labels_ == label
-            cluster_indices = indices[cluster_mask]
-            clusters.append(cluster_indices)
+            # Sample points for faster clustering
+            sample_ratio = min(0.3, 20000 / len(cluster_points))
+            sample_size = int(len(cluster_points) * sample_ratio)
+            sample_indices = np.random.choice(len(cluster_points), sample_size, replace=False)
+            sample_points = cluster_points[sample_indices]
+            
+            logger.info(f"Clustering on {len(sample_points)} sampled points")
+            
+            # Apply DBSCAN clustering on sample
+            clustering = DBSCAN(
+                eps=self.detection_params['cluster_eps'],
+                min_samples=max(5, self.detection_params['cluster_min_samples'] // 2)
+            ).fit(sample_points)
+            
+            # Find cluster centers and assign all points
+            clusters = []
+            unique_labels = np.unique(clustering.labels_)
+            
+            for label in unique_labels:
+                if label == -1:  # Noise points
+                    continue
+                
+                # Get cluster center
+                cluster_mask = clustering.labels_ == label
+                cluster_sample_points = sample_points[cluster_mask]
+                cluster_center = np.mean(cluster_sample_points, axis=0)
+                
+                # Find all points within cluster radius of center
+                distances = np.linalg.norm(cluster_points - cluster_center, axis=1)
+                cluster_radius = self.detection_params['cluster_eps'] * 1.5
+                within_cluster = distances <= cluster_radius
+                
+                if np.sum(within_cluster) >= self.detection_params['cluster_min_samples']:
+                    cluster_indices = indices[within_cluster]
+                    clusters.append(cluster_indices)
+            
+        else:
+            # Standard DBSCAN for smaller datasets
+            clustering = DBSCAN(
+                eps=self.detection_params['cluster_eps'],
+                min_samples=self.detection_params['cluster_min_samples']
+            ).fit(cluster_points)
+            
+            clusters = []
+            unique_labels = np.unique(clustering.labels_)
+            
+            for label in unique_labels:
+                if label == -1:  # Noise points
+                    continue
+                
+                cluster_mask = clustering.labels_ == label
+                cluster_indices = indices[cluster_mask]
+                clusters.append(cluster_indices)
         
         logger.info(f"Found {len(clusters)} clusters from {len(indices)} points")
         return clusters
